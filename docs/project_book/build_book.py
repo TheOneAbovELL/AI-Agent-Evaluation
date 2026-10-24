@@ -1,0 +1,613 @@
+"""Build the TraceGrade project book.
+
+    uv run --group docs python docs/project_book/build_book.py [--skip-pdf] [--skip-docx]
+
+Inputs:  docs/project_book/chapters/*.md (edited by hand), images/*.jpg (UI screenshots).
+Outputs: PROJECT_BOOK.md (assembled manuscript with a table of contents),
+         PROJECT_BOOK.html, PROJECT_BOOK.pdf, PROJECT_BOOK.docx,
+         images/diagrams/diagram_<hash>.svg/.png (rendered Mermaid diagrams, cached).
+
+Diagram rendering and PDF printing use a headless Chromium browser (Microsoft Edge or Google
+Chrome; override with TRACEGRADE_BROWSER=<path>). Rendering a *new or changed* diagram loads
+mermaid.js from a CDN, so it needs network access once; cached diagrams are reused offline.
+If no browser is available, the Markdown and DOCX are still produced (diagrams as source) and
+the PDF step is reported as skipped.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import html
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+import markdown
+from docx import Document
+from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.shared import Inches, Pt, RGBColor
+from markdown.extensions.toc import slugify
+
+ROOT = Path(__file__).resolve().parent
+CHAPTERS = ROOT / "chapters"
+IMAGES = ROOT / "images"
+DIAGRAMS = IMAGES / "diagrams"
+BUILD = ROOT / "build"
+MERMAID_CDN = "https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js"
+MERMAID_BLOCK = re.compile(r"```mermaid\n(.*?)```", re.S)
+
+# Chrome first: on Windows, msedge.exe can hand the job to a background process and return
+# immediately, so --dump-dom output is lost (observed with Edge 155). Files written by
+# --print-to-pdf / --screenshot are still produced; wait_for_file() covers that case.
+BROWSER_CANDIDATES = [
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+]
+
+
+# --------------------------------------------------------------------------- assemble --
+def read_front_matter(text: str) -> tuple[dict[str, str], str]:
+    meta: dict[str, str] = {}
+    if text.startswith("---\n"):
+        end = text.index("\n---", 4)
+        for line in text[4:end].splitlines():
+            key, _, value = line.partition(":")
+            meta[key.strip()] = value.strip().strip('"')
+        text = text[end + 4 :].lstrip("\n")
+    return meta, text
+
+
+PROJECT_ROOT = ROOT.parents[1]
+INCLUDE = re.compile(r"^\{\{(code|doc):([^}:]+)(?::([a-z]+))?\}\}$", re.M)
+
+
+def expand_includes(text: str) -> str:
+    """Replace include directives so the book quotes source files instead of copying them.
+
+    ``{{code:path:lang}}`` inserts a file as a fenced code block; ``{{doc:path}}`` inserts a
+    Markdown document without its title line, with every heading demoted one level.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        kind, rel, lang = match.group(1), match.group(2), match.group(3) or ""
+        source = (PROJECT_ROOT / rel).read_text(encoding="utf-8").rstrip("\n")
+        if kind == "code":
+            return f"_Source: `{rel}`_\n\n```{lang}\n{source}\n```"
+        lines = source.splitlines()
+        if lines and lines[0].startswith("# "):
+            lines = lines[1:]
+        out, in_code = [], False
+        for line in lines:
+            if line.startswith("```"):
+                in_code = not in_code
+            out.append("#" + line if not in_code and re.match(r"^#{1,5} ", line) else line)
+        return f"_Source: `{rel}`_\n" + "\n".join(out)
+
+    return INCLUDE.sub(replace, text)
+
+
+def assemble() -> tuple[dict[str, str], str]:
+    files = sorted(CHAPTERS.glob("*.md"))
+    if not files:
+        raise SystemExit(f"No chapters found in {CHAPTERS}")
+    meta, first = read_front_matter(files[0].read_text(encoding="utf-8"))
+    body = "\n\n".join([first] + [f.read_text(encoding="utf-8") for f in files[1:]])
+    body = expand_includes(body)
+    toc_lines = ["# Contents", ""]
+    in_code = False
+    for line in body.splitlines():
+        if line.startswith("```"):
+            in_code = not in_code
+        if in_code:
+            continue
+        m = re.match(r"^(#{1,2}) (.+)$", line)
+        if m:
+            indent = "" if len(m.group(1)) == 1 else "    "
+            title = m.group(2).strip()
+            toc_lines.append(f"{indent}- [{title}](#{slugify(title, '-')})")
+    title_block = (
+        f"# {meta.get('title', 'Project Book')}\n\n"
+        f"**{meta.get('subtitle', '')}**\n\n"
+        f"{meta.get('version', '')} · {meta.get('date', '')}\n"
+    )
+    manuscript = (
+        "<!-- Generated by docs/project_book/build_book.py from chapters/*.md. "
+        "Edit the chapters, not this file. -->\n\n"
+        + title_block
+        + "\n\n"
+        + "\n".join(toc_lines)
+        + "\n\n"
+        + body
+    )
+    (ROOT / "PROJECT_BOOK.md").write_text(manuscript, encoding="utf-8")
+    return meta, body
+
+
+# --------------------------------------------------------------------------- browser --
+def find_browser() -> str | None:
+    override = os.environ.get("TRACEGRADE_BROWSER")
+    if override:
+        return override
+    for candidate in BROWSER_CANDIDATES:
+        if Path(candidate).exists():
+            return candidate
+    for name in ("google-chrome", "chromium", "chromium-browser", "chrome", "msedge"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def run_browser(
+    browser: str, args: list[str], timeout: int = 180
+) -> subprocess.CompletedProcess[str]:
+    profile = tempfile.mkdtemp(prefix="book-browser-")
+    command = [
+        browser,
+        "--headless",
+        "--disable-gpu",
+        "--no-first-run",
+        "--disable-extensions",
+        f"--user-data-dir={profile}",
+        *args,
+    ]
+    try:
+        return subprocess.run(  # noqa: S603 - fixed argv
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            encoding="utf-8",
+            errors="replace",
+        )
+    finally:
+        shutil.rmtree(profile, ignore_errors=True)
+
+
+def wait_for_file(path: Path, timeout: float = 120.0) -> bool:
+    """Wait until ``path`` exists and its size has stopped changing."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    last = -1
+    while time.monotonic() < deadline:
+        if path.exists():
+            size = path.stat().st_size
+            if size > 0 and size == last:
+                return True
+            last = size
+        time.sleep(0.5)
+    return path.exists()
+
+
+# --------------------------------------------------------------------------- diagrams --
+def diagram_key(source: str) -> str:
+    return hashlib.sha256(source.strip().encode("utf-8")).hexdigest()[:12]
+
+
+def render_diagrams(sources: list[str], browser: str | None) -> dict[str, Path]:
+    """Return {key: svg_path} for every diagram that is (or could be) rendered."""
+    DIAGRAMS.mkdir(parents=True, exist_ok=True)
+    keys = {diagram_key(s): s for s in sources}
+    for cached in DIAGRAMS.glob("diagram_*.*"):  # drop renders of diagrams no longer in the book
+        if cached.stem.removeprefix("diagram_") not in keys:
+            cached.unlink()
+    missing = {k: s for k, s in keys.items() if not (DIAGRAMS / f"diagram_{k}.svg").exists()}
+    if missing and browser:
+        BUILD.mkdir(exist_ok=True)
+        divs = "\n".join(
+            f'<div class="mermaid" id="d_{k}">\n{html.escape(s)}\n</div>'
+            for k, s in missing.items()
+        )
+        page = BUILD / "diagrams_render.html"
+        page.write_text(
+            "<!doctype html><html><head><meta charset='utf-8'>"
+            f"<script src='{MERMAID_CDN}'></script></head><body>{divs}"
+            "<script>mermaid.initialize({startOnLoad:true, theme:'neutral',"
+            "flowchart:{htmlLabels:false}, securityLevel:'strict'});</script></body></html>",
+            encoding="utf-8",
+        )
+        result = run_browser(browser, ["--virtual-time-budget=30000", "--dump-dom", page.as_uri()])
+        dom = result.stdout
+        for k in missing:
+            m = re.search(rf'<div class="mermaid" id="d_{k}"[^>]*>\s*(<svg.*?</svg>)', dom, re.S)
+            if m:
+                (DIAGRAMS / f"diagram_{k}.svg").write_text(m.group(1), encoding="utf-8")
+            else:
+                print(f"  warning: diagram {k} was not rendered (network or syntax problem)")
+    rendered = {
+        k: DIAGRAMS / f"diagram_{k}.svg" for k in keys if (DIAGRAMS / f"diagram_{k}.svg").exists()
+    }
+    if browser:
+        for k, svg_path in rendered.items():
+            png = svg_path.with_suffix(".png")
+            if png.exists():
+                continue
+            svg = svg_path.read_text(encoding="utf-8")
+            vb = re.search(r'viewBox="[-\d.]+ [-\d.]+ ([\d.]+) ([\d.]+)"', svg)
+            width, height = (
+                (int(float(vb.group(1))) + 4, int(float(vb.group(2))) + 4) if vb else (900, 600)
+            )
+            sized = re.sub(r'<svg([^>]*?)\swidth="[^"]*"', r"<svg\1", svg, count=1)
+            sized = sized.replace("<svg", f'<svg width="{width}" height="{height}"', 1)
+            wrapper = BUILD / f"png_{k}.html"
+            wrapper.write_text(
+                "<!doctype html><html><head><meta charset='utf-8'><style>html,body{margin:0;"
+                f"background:#fff}}svg{{max-width:none!important}}</style></head><body>{sized}</body></html>",
+                encoding="utf-8",
+            )
+            run_browser(
+                browser,
+                [
+                    f"--screenshot={png}",
+                    f"--window-size={width},{height}",
+                    "--force-device-scale-factor=2",
+                    "--hide-scrollbars",
+                    "--default-background-color=FFFFFFFF",
+                    wrapper.as_uri(),
+                ],
+            )
+            wait_for_file(png, timeout=30)
+    return rendered
+
+
+# --------------------------------------------------------------------------- HTML/PDF --
+CSS = """
+@page { size: A4; margin: 20mm 16mm 20mm 16mm;
+  @top-right { content: "TraceGrade — Project Book"; font: 8pt 'Segoe UI', sans-serif; color: #6b7280; }
+  @bottom-center { content: "Page " counter(page) " of " counter(pages); font: 8pt 'Segoe UI', sans-serif; color: #6b7280; } }
+@page :first { @top-right { content: none; } @bottom-center { content: none; } }
+html { font: 10.5pt/1.5 'Segoe UI', 'Helvetica Neue', Arial, sans-serif; color: #1f2933; }
+body { max-width: 900px; margin: 0 auto; padding: 0 12px; }
+h1 { font-size: 22pt; color: #1e3a8a; border-bottom: 2px solid #2563eb; padding-bottom: 4px; margin-top: 0; }
+h2 { font-size: 15pt; color: #1e3a8a; margin-top: 1.6em; }
+h3 { font-size: 12pt; margin-top: 1.3em; }
+h4 { font-size: 11pt; }
+h1 { break-before: page; }
+.titlepage h1 { break-before: auto; border: none; font-size: 32pt; margin-top: 30%; }
+.titlepage { break-after: page; text-align: left; }
+.titlepage .sub { font-size: 14pt; color: #374151; }
+.titlepage .ver { margin-top: 3em; color: #6b7280; }
+nav.toc ul { list-style: none; padding-left: 0; } nav.toc ul ul { padding-left: 1.4em; }
+nav.toc a { color: #1f2933; text-decoration: none; } nav.toc { break-after: page; font-size: 9.5pt; }
+code { font: 9pt Consolas, 'Courier New', monospace; background: #f3f4f6; padding: 0 2px; border-radius: 2px; }
+pre { background: #f6f8fa; border: 1px solid #e5e7eb; border-radius: 4px; padding: 8px 10px;
+      white-space: pre-wrap; word-break: break-word; font-size: 8.5pt; break-inside: avoid; }
+pre code { background: none; padding: 0; }
+table { border-collapse: collapse; width: 100%; margin: 0.8em 0; font-size: 8.8pt; }
+th, td { border: 1px solid #d1d5db; padding: 3px 6px; vertical-align: top; text-align: left; }
+th { background: #eef2ff; }
+tr { break-inside: avoid; }
+img { max-width: 100%; border: 1px solid #e5e7eb; }
+.diagram { text-align: center; margin: 1em 0; break-inside: avoid; }
+.diagram svg { max-width: 100%; height: auto; }
+blockquote { border-left: 3px solid #93c5fd; margin-left: 0; padding-left: 12px; color: #374151; }
+a { color: #1d4ed8; }
+"""
+
+
+def build_html(meta: dict[str, str], body: str, svgs: dict[str, Path]) -> Path:
+    placeholders: dict[str, str] = {}
+
+    def replace(match: re.Match[str]) -> str:
+        source = match.group(1)
+        key = diagram_key(source)
+        token = f"DIAGRAMTOKEN{len(placeholders)}X"
+        if key in svgs:
+            placeholders[token] = (
+                f'<div class="diagram">{svgs[key].read_text(encoding="utf-8")}</div>'
+            )
+        else:
+            placeholders[token] = f'<pre class="mermaid">{html.escape(source)}</pre>'
+        return f"\n{token}\n"
+
+    md_body = MERMAID_BLOCK.sub(replace, body)
+    converter = markdown.Markdown(
+        extensions=["tables", "fenced_code", "codehilite", "toc", "sane_lists", "attr_list"],
+        extension_configs={
+            "codehilite": {"guess_lang": False, "noclasses": True},
+            "toc": {"toc_depth": "1-2"},
+        },
+    )
+    content = converter.convert(md_body)
+    for token, replacement in placeholders.items():
+        content = content.replace(f"<p>{token}</p>", replacement)
+    toc = converter.toc  # type: ignore[attr-defined]
+    title = html.escape(meta.get("title", "Project Book"))
+    needs_mermaid_js = any('class="mermaid"' in v for v in placeholders.values())
+    document = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>{title}</title>
+<style>{CSS}</style>
+{f'<script src="{MERMAID_CDN}"></script>' if needs_mermaid_js else ""}
+</head><body>
+<section class="titlepage"><h1>{title}</h1>
+<p class="sub">{html.escape(meta.get("subtitle", ""))}</p>
+<p class="ver">{html.escape(meta.get("version", ""))}<br>{html.escape(meta.get("date", ""))}</p></section>
+<nav class="toc"><h1 style="break-before:auto">Contents</h1>{toc}</nav>
+{content}
+{'<script>mermaid.initialize({startOnLoad:true, theme:"neutral"});</script>' if needs_mermaid_js else ""}
+</body></html>"""
+    out = ROOT / "PROJECT_BOOK.html"
+    out.write_text(document, encoding="utf-8")
+    return out
+
+
+def build_pdf(html_path: Path, browser: str) -> Path | None:
+    pdf = ROOT / "PROJECT_BOOK.pdf"
+    if pdf.exists():
+        pdf.unlink()
+    result = run_browser(
+        browser,
+        [
+            "--no-pdf-header-footer",
+            "--virtual-time-budget=20000",
+            f"--print-to-pdf={pdf}",
+            html_path.as_uri(),
+        ],
+        timeout=300,
+    )
+    if not wait_for_file(pdf):
+        print("  PDF generation failed:", (result.stderr or "")[-500:])
+        return None
+    return pdf
+
+
+# --------------------------------------------------------------------------- DOCX --
+INLINE = re.compile(r"(\*\*[^*]+\*\*|`[^`]+`|\*[^*\s][^*]*\*|\[[^\]]+\]\([^)]+\))")
+
+
+def add_inline(paragraph, text: str) -> None:
+    for part in INLINE.split(text):
+        if not part:
+            continue
+        if part.startswith("**") and part.endswith("**"):
+            paragraph.add_run(part[2:-2]).bold = True
+        elif part.startswith("`") and part.endswith("`"):
+            run = paragraph.add_run(part[1:-1])
+            run.font.name = "Consolas"
+            run.font.size = Pt(9)
+        elif part.startswith("[") and "](" in part:
+            label, url = re.match(r"\[([^\]]+)\]\(([^)]+)\)", part).groups()  # type: ignore[union-attr]
+            paragraph.add_run(label if url.startswith("#") else f"{label} ({url})")
+        elif part.startswith("*") and part.endswith("*") and len(part) > 2:
+            paragraph.add_run(part[1:-1]).italic = True
+        else:
+            paragraph.add_run(part.replace("\\$", "$"))
+
+
+def shade(paragraph, color: str = "F3F4F6") -> None:
+    ppr = paragraph._p.get_or_add_pPr()
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), color)
+    ppr.append(shd)
+
+
+def add_field(paragraph, instruction: str) -> None:
+    run = paragraph.add_run()
+    for tag, text in (("begin", None), ("instr", instruction), ("separate", None), ("end", None)):
+        if tag == "instr":
+            el = OxmlElement("w:instrText")
+            el.set(qn("xml:space"), "preserve")
+            el.text = text
+        else:
+            el = OxmlElement("w:fldChar")
+            el.set(qn("w:fldCharType"), tag)
+        run._r.append(el)
+
+
+def add_table(doc, rows: list[list[str]]) -> None:
+    width = max(len(r) for r in rows)
+    table = doc.add_table(rows=len(rows), cols=width)
+    table.style = "Table Grid"
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    for i, row in enumerate(rows):
+        for j in range(width):
+            cell = table.cell(i, j)
+            cell.text = ""
+            para = cell.paragraphs[0]
+            add_inline(para, row[j] if j < len(row) else "")
+            for run in para.runs:
+                run.font.size = Pt(8.5)
+                if i == 0:
+                    run.bold = True
+    doc.add_paragraph()
+
+
+def split_row(line: str) -> list[str]:
+    cells = re.split(r"(?<!\\)\|", line.strip().strip("|"))
+    return [c.strip().replace("\\|", "|") for c in cells]
+
+
+def build_docx(meta: dict[str, str], body: str, svgs: dict[str, Path]) -> Path:
+    doc = Document()
+    normal = doc.styles["Normal"]
+    normal.font.name = "Calibri"
+    normal.font.size = Pt(10.5)
+    section = doc.sections[0]
+    section.left_margin = section.right_margin = Inches(0.9)
+    footer = section.footer.paragraphs[0]
+    footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    footer.add_run("Page ")
+    add_field(footer, "PAGE")
+    header = section.header.paragraphs[0]
+    header.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    header.add_run("TraceGrade — Project Book").font.size = Pt(8)
+
+    title = doc.add_paragraph()
+    title.paragraph_format.space_before = Pt(180)
+    run = title.add_run(meta.get("title", "Project Book"))
+    run.bold = True
+    run.font.size = Pt(28)
+    run.font.color.rgb = RGBColor(0x1E, 0x3A, 0x8A)
+    sub = doc.add_paragraph()
+    sub.add_run(meta.get("subtitle", "")).font.size = Pt(14)
+    doc.add_paragraph(f"{meta.get('version', '')} · {meta.get('date', '')}")
+    doc.add_page_break()
+    doc.add_heading("Contents", level=1)
+    toc_para = doc.add_paragraph()
+    add_field(toc_para, 'TOC \\o "1-2" \\h \\z \\u')
+    doc.add_paragraph(
+        "Right-click the table of contents and choose Update Field to populate it."
+    ).runs[0].italic = True
+    settings = doc.settings.element
+    update = OxmlElement("w:updateFields")
+    update.set(qn("w:val"), "true")
+    settings.append(update)
+
+    lines = body.splitlines()
+    i = 0
+    paragraph_buffer: list[str] = []
+
+    def flush() -> None:
+        if paragraph_buffer:
+            add_inline(doc.add_paragraph(), " ".join(s.strip() for s in paragraph_buffer))
+            paragraph_buffer.clear()
+
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("```"):
+            flush()
+            lang = line[3:].strip()
+            block: list[str] = []
+            i += 1
+            while i < len(lines) and not lines[i].startswith("```"):
+                block.append(lines[i])
+                i += 1
+            source = "\n".join(block) + "\n"
+            png = svgs.get(diagram_key(source))
+            png = png.with_suffix(".png") if png is not None else None
+            if lang == "mermaid" and png is not None and png.exists():
+                doc.add_picture(str(png), width=Inches(6.2))
+                doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+            else:
+                for code_line in block or [""]:
+                    p = doc.add_paragraph()
+                    p.paragraph_format.space_after = Pt(0)
+                    r = p.add_run(code_line)
+                    r.font.name = "Consolas"
+                    r.font.size = Pt(8)
+                    shade(p)
+                doc.add_paragraph()
+            i += 1
+            continue
+        heading = re.match(r"^(#{1,4}) (.+)$", line)
+        if heading:
+            flush()
+            level = len(heading.group(1))
+            if level == 1:
+                doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
+            doc.add_heading(heading.group(2).strip(), level=level)
+            i += 1
+            continue
+        if line.startswith("|"):
+            flush()
+            rows = []
+            while i < len(lines) and lines[i].startswith("|"):
+                if not re.match(r"^\|[\s:|-]+\|?$", lines[i]):
+                    rows.append(split_row(lines[i]))
+                i += 1
+            add_table(doc, rows)
+            continue
+        image = re.match(r"^!\[([^\]]*)\]\(([^)]+)\)", line)
+        if image:
+            flush()
+            path = ROOT / image.group(2)
+            if path.exists():
+                doc.add_picture(str(path), width=Inches(6.2))
+                cap = doc.add_paragraph(image.group(1))
+                cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                cap.runs[0].italic = True
+            i += 1
+            continue
+        bullet = re.match(r"^(\s*)[*-] (.+)$", line)
+        number = re.match(r"^(\s*)\d+\. (.+)$", line)
+        if bullet or number:
+            flush()
+            m = bullet or number
+            text = m.group(2)  # type: ignore[union-attr]
+            indent = len(m.group(1))  # type: ignore[union-attr]
+            i += 1
+            while (
+                i < len(lines)
+                and lines[i].startswith(" " * (indent + 2))
+                and lines[i].strip()
+                and not re.match(r"^\s*([*-]|\d+\.) ", lines[i])
+            ):
+                text += " " + lines[i].strip()
+                i += 1
+            style = "List Bullet" if bullet else "List Number"
+            if indent >= 2:
+                style += " 2"
+            add_inline(doc.add_paragraph(style=style), text)
+            continue
+        if line.startswith(">"):
+            flush()
+            quote = doc.add_paragraph(style="Quote")
+            add_inline(quote, line.lstrip("> ").strip())
+            i += 1
+            continue
+        if not line.strip() or line.strip() == "---":
+            flush()
+            i += 1
+            continue
+        if (
+            line.lstrip().startswith("<details")
+            or line.lstrip().startswith("</details")
+            or line.lstrip().startswith("<summary")
+        ):
+            i += 1
+            continue
+        paragraph_buffer.append(line)
+        i += 1
+    flush()
+    out = ROOT / "PROJECT_BOOK.docx"
+    doc.save(str(out))
+    return out
+
+
+# --------------------------------------------------------------------------- main --
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--skip-pdf", action="store_true")
+    parser.add_argument("--skip-docx", action="store_true")
+    args = parser.parse_args()
+
+    meta, body = assemble()
+    words = len(re.findall(r"\w+", body))
+    print(f"Assembled PROJECT_BOOK.md ({words:,} words)")
+    browser = find_browser()
+    print(f"Browser: {browser or 'not found (diagram rendering and PDF skipped)'}")
+    sources = [m.group(1) for m in MERMAID_BLOCK.finditer(body)]
+    svgs = render_diagrams(sources, browser)
+    print(f"Diagrams: {len(svgs)}/{len(sources)} rendered (cached in {DIAGRAMS.relative_to(ROOT)})")
+    html_path = build_html(meta, body, svgs)
+    print(f"Wrote {html_path.name}")
+    if not args.skip_pdf:
+        if browser:
+            pdf = build_pdf(html_path, browser)
+            print(f"Wrote {pdf.name}" if pdf else "PDF: FAILED (see message above)")
+        else:
+            print("PDF: skipped (no Chromium-based browser found; set TRACEGRADE_BROWSER)")
+    if not args.skip_docx:
+        print(f"Wrote {build_docx(meta, body, svgs).name}")
+    shutil.rmtree(BUILD, ignore_errors=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

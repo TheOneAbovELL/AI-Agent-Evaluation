@@ -1,0 +1,87 @@
+[project]
+name = "tracegrade"
+version = "1.0.0"
+description = "Evaluation workbench for tool-using LangChain agents: deterministic checks plus DeepEval LLM-as-a-judge metrics, with run history and a Streamlit UI."
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "langchain>=1.4.4,<2",
+    "langchain-core>=1.6.9,<2",
+    "langgraph>=1.2.14,<2",
+    "langchain-openai>=1.7.0,<2",
+    "langchain-groq>=1.0.0,<2",
+    "deepeval>=4.2.8,<5",
+    "pydantic>=2.11.7,<3",
+    "pydantic-settings>=2.10.1,<3",
+    "python-dotenv>=1.1.1,<2",
+    "streamlit>=1.40,<2",
+    "pandas>=2.2,<4",
+    "altair>=5,<7",
+]
+
+[project.scripts]
+tracegrade = "tracegrade.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "bandit>=1.8",
+    "pip-audit>=2.7",
+]
+# Only needed to rebuild docs/project_book (PDF/DOCX/HTML).
+docs = [
+    "markdown>=3.7",
+    "pygments>=2.18",
+    "python-docx>=1.1",
+]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tracegrade"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# DeepEval auto-registers a pytest plugin for its own test runner; TraceGrade's tests don't use it.
+addopts = "-ra --strict-markers -p no:deepeval"
+markers = [
+    "live: calls a real LLM provider; requires API keys and TRACEGRADE_RUN_LIVE_TESTS=1",
+    "ui: drives the Streamlit app through streamlit.testing",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:deepeval.*",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "S"]
+ignore = ["S101", "RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "B011"]
+# Help text and Markdown tables shown in the UI read better unwrapped.
+"src/tracegrade/ui/pages/*.py" = ["E501"]
+# Embedded CSS/HTML templates in the book generator.
+"docs/project_book/build_book.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+packages = ["tracegrade"]
+mypy_path = "src"
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+check_untyped_defs = true
+
+[tool.coverage.run]
+source = ["tracegrade"]
+branch = true
